@@ -73,12 +73,14 @@ typedef struct {
 
 
 typedef struct {
-    ngx_array_t                *logs;       /* array of ngx_http_log_t */
+    ngx_array_t                *pre_logs;
+    ngx_array_t                *logs;       /* arrays of ngx_http_log_t */
 
     ngx_open_file_cache_t      *open_file_cache;
     time_t                      open_file_cache_valid;
     ngx_uint_t                  open_file_cache_min_uses;
 
+    ngx_uint_t                  pre_off;
     ngx_uint_t                  off;        /* unsigned  off:1 */
 } ngx_http_log_loc_conf_t;
 
@@ -151,8 +153,14 @@ static void *ngx_http_log_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_log_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_log_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
-static char *ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd,
+static char *ngx_http_log_set_pre_log(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_log_set_post_log(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_log_set_log(ngx_conf_t *cf, ngx_uint_t* off,
+    ngx_array_t** logs);
+static ngx_int_t ngx_http_log_handler(ngx_http_request_t *r,
+    ngx_array_t* logs);
 static char *ngx_http_log_set_format(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_log_compile_format(ngx_conf_t *cf,
@@ -171,10 +179,18 @@ static ngx_command_t  ngx_http_log_commands[] = {
       0,
       NULL },
 
+    { ngx_string("access_log_pre"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
+                        |NGX_HTTP_LMT_CONF|NGX_CONF_1MORE,
+      ngx_http_log_set_pre_log,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("access_log"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
                         |NGX_HTTP_LMT_CONF|NGX_CONF_1MORE,
-      ngx_http_log_set_log,
+      ngx_http_log_set_post_log,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -249,9 +265,43 @@ static ngx_http_log_var_t  ngx_http_log_vars[] = {
     { ngx_null_string, 0, NULL }
 };
 
+static ngx_int_t
+ngx_http_log_pre_handler(ngx_http_request_t *r)
+{
+    ngx_http_log_loc_conf_t  *lcf;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http log pre handler");
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_log_module);
+
+    if (lcf->pre_off || !lcf->pre_logs) {
+        return NGX_OK;
+    }
+
+    return ngx_http_log_handler(r, lcf->pre_logs);
+}
 
 static ngx_int_t
-ngx_http_log_handler(ngx_http_request_t *r)
+ngx_http_log_post_handler(ngx_http_request_t *r)
+{
+    ngx_http_log_loc_conf_t  *lcf;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http log post handler");
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_log_module);
+
+    if (lcf->off) {
+        return NGX_OK;
+    }
+
+    return ngx_http_log_handler(r, lcf->logs);
+}
+
+
+static ngx_int_t
+ngx_http_log_handler(ngx_http_request_t *r, ngx_array_t* logs)
 {
     u_char                   *line, *p;
     size_t                    len, size;
@@ -261,19 +311,9 @@ ngx_http_log_handler(ngx_http_request_t *r)
     ngx_http_log_t           *log;
     ngx_http_log_op_t        *op;
     ngx_http_log_buf_t       *buffer;
-    ngx_http_log_loc_conf_t  *lcf;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http log handler");
-
-    lcf = ngx_http_get_module_loc_conf(r, ngx_http_log_module);
-
-    if (lcf->off) {
-        return NGX_OK;
-    }
-
-    log = lcf->logs->elts;
-    for (l = 0; l < lcf->logs->nelts; l++) {
+    log = logs->elts;
+    for (l = 0; l < logs->nelts; l++) {
 
         if (log[l].filter) {
             if (ngx_http_complex_value(r, log[l].filter, &val) != NGX_OK) {
@@ -1195,6 +1235,11 @@ ngx_http_log_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         }
     }
 
+    if (!conf->pre_logs && !conf->pre_off) {
+        conf->pre_logs = prev->pre_logs;
+        conf->pre_off = prev->pre_off;
+    }
+
     if (conf->logs || conf->off) {
         return NGX_CONF_OK;
     }
@@ -1233,12 +1278,25 @@ ngx_http_log_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
 static char *
-ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_log_set_pre_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_log_loc_conf_t *llcf = conf;
 
+    return ngx_http_log_set_log(cf, &llcf->pre_off, &llcf->pre_logs);
+}
+
+static char *
+ngx_http_log_set_post_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_log_loc_conf_t *llcf = conf;
+
+    return ngx_http_log_set_log(cf, &llcf->off, &llcf->logs);
+}
+
+static char *
+ngx_http_log_set_log(ngx_conf_t *cf, ngx_uint_t* off, ngx_array_t** logs)
+{
     ssize_t                            size;
     ngx_int_t                          gzip;
     ngx_uint_t                         i, n;
@@ -1255,7 +1313,7 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
 
     if (ngx_strcmp(value[1].data, "off") == 0) {
-        llcf->off = 1;
+        *off = 1;
         if (cf->args->nelts == 2) {
             return NGX_CONF_OK;
         }
@@ -1265,16 +1323,16 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (llcf->logs == NULL) {
-        llcf->logs = ngx_array_create(cf->pool, 2, sizeof(ngx_http_log_t));
-        if (llcf->logs == NULL) {
+    if (*logs == NULL) {
+        *logs = ngx_array_create(cf->pool, 2, sizeof(ngx_http_log_t));
+        if (*logs == NULL) {
             return NGX_CONF_ERROR;
         }
     }
 
     lmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_log_module);
 
-    log = ngx_array_push(llcf->logs);
+    log = ngx_array_push(*logs);
     if (log == NULL) {
         return NGX_CONF_ERROR;
     }
@@ -1903,14 +1961,14 @@ ngx_http_log_init(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    *h = ngx_http_log_handler;
+    *h = ngx_http_log_pre_handler;
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
 
-    *h = ngx_http_log_handler;
+    *h = ngx_http_log_post_handler;
 
     return NGX_OK;
 }
