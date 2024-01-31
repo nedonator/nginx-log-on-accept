@@ -327,6 +327,10 @@ ngx_http_log_handler(ngx_http_request_t *r, ngx_uint_t post_log)
 
         ngx_http_script_flush_no_cacheable_variables(r, flushes);
 
+        if (ops->nelts == 0) {
+            continue;
+        }
+
         len = 0;
         op = ops->elts;
         for (i = 0; i < ops->nelts; i++) {
